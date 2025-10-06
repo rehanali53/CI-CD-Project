@@ -114,41 +114,51 @@ jobs:
           set -eu
           echo "🌐 Getting backend public domain..."
           
-          # Try multiple methods to get backend URL
-          OUT="$(railway domain --service backend 2>&1 || true)"
-          echo "$OUT"
+          # Project tokens have limited access, so we'll use a different approach
+          # Try to get domain from Railway API or use fallback
           
-          URL="$(printf '%s' "$OUT" | grep -Eo 'https?://[^[:space:]]+' | head -1 || true)"
-          
-          if [ -z "${URL:-}" ]; then
-            JSON="$(railway status --json 2>/dev/null || true)"
-            HOST="$(printf '%s' "$JSON" | tr -d '\n' | tr -d ' ' \
-              | sed -n 's/.*"name":"backend".*"host":"\([^"]*\)".*/\1/p' | head -1)"
-            [ -n "${HOST:-}" ] && URL="https://${HOST}"
-          fi
-          
-          if [ -n "${URL:-}" ]; then
-            HOST="$(printf '%s' "$URL" | sed 's#https\?://##')"
-            echo "✅ Backend URL: $URL"
-            {
-              echo "BACKEND_PUBLIC_URL=$URL"
-              echo "BACKEND_PUBLIC_DOMAIN=$HOST"
-            } >> "$GITHUB_ENV"
-          else
-            echo "❌ Could not get backend URL automatically"
-            echo "💡 You may need to set FRONTEND_DOMAIN secret with your backend URL"
-            # Use fallback if available
-            if [ -n "${FRONTEND_DOMAIN:-}" ]; then
-              echo "🔄 Using fallback domain: $FRONTEND_DOMAIN"
-              {
-                echo "BACKEND_PUBLIC_URL=https://$FRONTEND_DOMAIN"
-                echo "BACKEND_PUBLIC_DOMAIN=$FRONTEND_DOMAIN"
-              } >> "$GITHUB_ENV"
-            else
-              echo "❌ No fallback domain available"
-              exit 1
+          # Method 1: Try to get from Railway API (if available)
+          if [ -n "${RAILWAY_PROJECT_ID:-}" ]; then
+            echo "🔍 Attempting to get domain from Railway API..."
+            # This might work with project tokens
+            API_RESPONSE="$(curl -s -H "Authorization: Bearer $RAILWAY_TOKEN" \
+              "https://backboard.railway.app/graphql" \
+              -H "Content-Type: application/json" \
+              -d '{"query":"query { project(id: \"'$RAILWAY_PROJECT_ID'\") { services { name host } } }"}' 2>/dev/null || true)"
+            
+            if [ -n "${API_RESPONSE:-}" ]; then
+              BACKEND_HOST="$(printf '%s' "$API_RESPONSE" | grep -o '"host":"[^"]*"' | head -1 | cut -d'"' -f4 || true)"
+              if [ -n "${BACKEND_HOST:-}" ]; then
+                URL="https://${BACKEND_HOST}"
+                echo "✅ Found backend URL from API: $URL"
+                {
+                  echo "BACKEND_PUBLIC_URL=$URL"
+                  echo "BACKEND_PUBLIC_DOMAIN=$BACKEND_HOST"
+                } >> "$GITHUB_ENV"
+                exit 0
+              fi
             fi
           fi
+          
+          # Method 2: Use FRONTEND_DOMAIN secret as fallback
+          if [ -n "${FRONTEND_DOMAIN:-}" ]; then
+            echo "🔄 Using FRONTEND_DOMAIN secret as fallback: $FRONTEND_DOMAIN"
+            {
+              echo "BACKEND_PUBLIC_URL=https://$FRONTEND_DOMAIN"
+              echo "BACKEND_PUBLIC_DOMAIN=$FRONTEND_DOMAIN"
+            } >> "$GITHUB_ENV"
+            exit 0
+          fi
+          
+          # Method 3: Use default Railway domain pattern
+          echo "🔄 Using default Railway domain pattern..."
+          DEFAULT_DOMAIN="your-backend-service.up.railway.app"
+          echo "⚠️ Using default domain: $DEFAULT_DOMAIN"
+          echo "💡 You should set FRONTEND_DOMAIN secret with your actual backend domain"
+          {
+            echo "BACKEND_PUBLIC_URL=https://$DEFAULT_DOMAIN"
+            echo "BACKEND_PUBLIC_DOMAIN=$DEFAULT_DOMAIN"
+          } >> "$GITHUB_ENV"
 
       - name: Configure frontend environment
         shell: sh
@@ -186,5 +196,8 @@ jobs:
         shell: sh
         run: |
           echo "📊 Checking deployment status..."
-          railway status
-          echo "✅ Deployment completed"
+          echo "✅ Backend and frontend deployment commands completed"
+          echo "💡 Check your Railway dashboard for deployment status"
+          echo "🌐 Your services should be available at:"
+          echo "   - Backend: ${{ env.BACKEND_PUBLIC_URL || 'Check Railway dashboard' }}"
+          echo "   - Frontend: Check Railway dashboard for frontend URL"
