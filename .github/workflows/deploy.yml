@@ -1,33 +1,190 @@
-name: Deploy to Railway
+name: Deploy to Railway (Project Token)
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
+  workflow_dispatch:
+
+concurrency:
+  group: railway-deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Project token - limited access
+  RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+  RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
 
 jobs:
-  test:
+  deploy:
+    name: Deploy to Railway
     runs-on: ubuntu-latest
-    
+    env:
+      RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
+
+    # Only deploy on push to main/master or manual workflow dispatch
+    if: ${{ github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Setup Node.js
-      uses: actions/setup-node@v4
-      with:
-        node-version: '18'
+      - name: Install Railway CLI
+        shell: sh
+        run: |
+          set -eu
+          echo "📦 Installing Railway CLI..."
+          curl -fsSL https://railway.app/install.sh | sh
+          echo "✅ Railway CLI installed"
+          echo "$HOME/.railway/bin" >> $GITHUB_PATH
+          export PATH="$HOME/.railway/bin:$PATH"
+          railway --version
 
-    - name: Install backend dependencies
-      run: |
-        cd backend
-        npm install
+      - name: Assert RAILWAY_TOKEN and RAILWAY_PROJECT_ID present
+        shell: sh
+        run: |
+          set -eu
+          if [ -z "${RAILWAY_TOKEN:-}" ]; then
+            echo "❌ RAILWAY_TOKEN is empty/unavailable"
+            exit 1
+          fi
+          LAST4=$(printf "%s" "$RAILWAY_TOKEN" | awk '{print substr($0,length($0)-3,4)}')
+          echo "✅ RAILWAY_TOKEN ends with: ****${LAST4}"
+          if [ -z "${RAILWAY_PROJECT_ID:-}" ]; then
+            echo "❌ RAILWAY_PROJECT_ID is empty/unavailable"
+            exit 1
+          fi
+          echo "✅ RAILWAY_PROJECT_ID provided."
 
-    - name: Install frontend dependencies
-      run: |
-        cd frontend
-        npm install
+      - name: Configure backend environment
+        shell: sh
+        run: |
+          set -eu
+          echo "🔧 Setting backend environment variables..."
+          railway variables -e "${RAILWAY_ENV:-production}" -s backend \
+            --set "NODE_ENV=production" \
+            --set "PORT=5000" \
+            --set "CORS_ORIGIN=https://${{ secrets.FRONTEND_DOMAIN || 'your-frontend-domain.up.railway.app' }}"
+          echo "✅ Backend environment configured"
 
-    - name: Build frontend
-      run: |
-        cd frontend
-        npm run build
+      - name: Set PostgreSQL connection
+        shell: sh
+        run: |
+          set -eu
+          echo "🔗 Setting up database connection..."
+          # Try to get DATABASE_URL from Postgres service
+          for SVC in Postgres postgres PostgreSQL postgresql; do
+            echo "🔎 Checking service: $SVC"
+            if PGVARS="$(railway variables -e "${RAILWAY_ENV:-production}" -s "$SVC" --kv 2>/dev/null)"; then
+              PG_URL="$(printf '%s\n' "$PGVARS" | awk -F= '$1=="DATABASE_URL"{print substr($0,index($0,$2))}')"
+              if [ -n "${PG_URL:-}" ]; then
+                echo "🔗 Found DATABASE_URL in $SVC"
+                railway variables -e "${RAILWAY_ENV:-production}" -s backend --set "DATABASE_URL=$PG_URL"
+                echo "✅ DATABASE_URL set for backend"
+                break
+              fi
+            fi
+          done
+          
+          if [ -z "${PG_URL:-}" ]; then
+            echo "⚠️ Could not find DATABASE_URL from Postgres service"
+            echo "💡 You may need to set DATABASE_URL manually in Railway dashboard"
+          fi
+
+      - name: Configure backend service build
+        shell: sh
+        run: |
+          set -eu
+          echo "🔧 Setting backend service configuration..."
+          railway variables -s backend \
+            --set "RAILWAY_DOCKERFILE_PATH=backend/Dockerfile" || true
+          echo "✅ Backend service configured"
+
+      - name: Deploy backend application
+        shell: sh
+        run: |
+          set -eu
+          echo "🚀 Deploying backend..."
+          railway up --service backend
+          echo "✅ Backend deployed successfully"
+
+      - name: Get backend public domain
+        shell: sh
+        run: |
+          set -eu
+          echo "🌐 Getting backend public domain..."
+          
+          # Try multiple methods to get backend URL
+          OUT="$(railway domain --service backend 2>&1 || true)"
+          echo "$OUT"
+          
+          URL="$(printf '%s' "$OUT" | grep -Eo 'https?://[^[:space:]]+' | head -1 || true)"
+          
+          if [ -z "${URL:-}" ]; then
+            JSON="$(railway status --json 2>/dev/null || true)"
+            HOST="$(printf '%s' "$JSON" | tr -d '\n' | tr -d ' ' \
+              | sed -n 's/.*"name":"backend".*"host":"\([^"]*\)".*/\1/p' | head -1)"
+            [ -n "${HOST:-}" ] && URL="https://${HOST}"
+          fi
+          
+          if [ -n "${URL:-}" ]; then
+            HOST="$(printf '%s' "$URL" | sed 's#https\?://##')"
+            echo "✅ Backend URL: $URL"
+            {
+              echo "BACKEND_PUBLIC_URL=$URL"
+              echo "BACKEND_PUBLIC_DOMAIN=$HOST"
+            } >> "$GITHUB_ENV"
+          else
+            echo "❌ Could not get backend URL automatically"
+            echo "💡 You may need to set FRONTEND_DOMAIN secret with your backend URL"
+            # Use fallback if available
+            if [ -n "${FRONTEND_DOMAIN:-}" ]; then
+              echo "🔄 Using fallback domain: $FRONTEND_DOMAIN"
+              {
+                echo "BACKEND_PUBLIC_URL=https://$FRONTEND_DOMAIN"
+                echo "BACKEND_PUBLIC_DOMAIN=$FRONTEND_DOMAIN"
+              } >> "$GITHUB_ENV"
+            else
+              echo "❌ No fallback domain available"
+              exit 1
+            fi
+          fi
+
+      - name: Configure frontend environment
+        shell: sh
+        run: |
+          set -eu
+          if [ -z "${BACKEND_PUBLIC_DOMAIN:-}" ]; then
+            echo "❌ BACKEND_PUBLIC_DOMAIN is empty"
+            exit 1
+          fi
+          API_URL="https://${BACKEND_PUBLIC_DOMAIN}"
+          echo "🔧 Setting frontend environment variables..."
+          railway variables -e "${RAILWAY_ENV:-production}" -s frontend \
+            --set "REACT_APP_API_URL=$API_URL" \
+            --set "NODE_ENV=production"
+          echo "✅ Frontend environment configured: $API_URL"
+
+      - name: Configure frontend service build
+        shell: sh
+        run: |
+          set -eu
+          echo "🔧 Setting frontend service configuration..."
+          railway variables -s frontend \
+            --set "RAILWAY_DOCKERFILE_PATH=frontend/Dockerfile" || true
+          echo "✅ Frontend service configured"
+
+      - name: Deploy Frontend Application
+        shell: sh
+        run: |
+          set -eu
+          echo "🚀 Deploying frontend..."
+          railway up --service frontend
+          echo "✅ Frontend deployed successfully"
+
+      - name: Check deployment status
+        shell: sh
+        run: |
+          echo "📊 Checking deployment status..."
+          railway status
+          echo "✅ Deployment completed"
